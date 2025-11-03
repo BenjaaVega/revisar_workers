@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+psycopg2-binary
+sqlalchemy
+python-dotenv
+pydantic
+python-jose
+requests==2.32.3
+paho-mqtt==1.6.1
+transbank-sdk>=3.0.0
+reportlab>=4.0.0

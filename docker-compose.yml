@@ -1,0 +1,204 @@
+services:
+
+  db:
+    image: postgres:16
+    container_name: postgres_db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "${DB_PORT}:${DB_PORT}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      retries: 5
+
+  api_1:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/api:latest
+    container_name: fastapi_app_1
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      CONTAINER_NAME: fastapi_app_1
+      HOST: 0.0.0.0
+      PORT: 8001
+      BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      REQUESTS_TOPIC: ${REQUESTS_TOPIC}
+      VALIDATION_TOPIC: ${VALIDATION_TOPIC}
+      INFO_TOPIC: ${INFO_TOPIC}
+      GROUP_ID: ${GROUP_ID}
+      WORKER_SERVICE_URL: http://jobmaster:8000
+    depends_on:
+      - db
+    ports:
+      - "8001:8000"
+
+  api_2:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/api:latest
+    container_name: fastapi_app_2
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      CONTAINER_NAME: fastapi_app_2
+      HOST: 0.0.0.0
+      PORT: 8002
+      BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      REQUESTS_TOPIC: ${REQUESTS_TOPIC}
+      VALIDATION_TOPIC: ${VALIDATION_TOPIC}
+      INFO_TOPIC: ${INFO_TOPIC}
+      GROUP_ID: ${GROUP_ID}
+      WORKER_SERVICE_URL: http://jobmaster:8000
+    depends_on:
+      - db
+    ports:
+      - "8002:8000"
+
+  mqtt_listener:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/mqtt_listener:latest
+    container_name: mqtt_listener
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      MQTT_BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TOPIC: ${TOPIC}
+      # Configuración de Email
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+      FROM_NAME: ${FROM_NAME:-Sistema de Propiedades}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Redis broker for Celery workers
+  redis:
+    image: redis:7-alpine
+    container_name: redis_broker
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # JobMaster service
+  jobmaster:
+    build:
+      context: ./jobmaster
+    container_name: jobmaster_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: db
+      DB_PORT: ${DB_PORT}
+    ports:
+      - "8003:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker 1
+  worker1:
+    build:
+      context: ./jobmaster/worker
+    container_name: celery_worker_1
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: db
+      DB_PORT: ${DB_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=2", "--hostname=worker1@%h"]
+
+  # Celery Worker 2
+  worker2:
+    build:
+      context: ./jobmaster/worker
+    container_name: celery_worker_2
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: db
+      DB_PORT: ${DB_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=2", "--hostname=worker2@%h"]
+
+  # Flower monitoring (optional)
+  flower:
+    build:
+      context: ./jobmaster/worker
+    container_name: flower_monitor
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "celery_app", "flower", "--port=5555"]
+
+volumes:
+  pgdata:
+  redis_data:

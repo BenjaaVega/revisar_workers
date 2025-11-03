@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+psycopg2-binary
