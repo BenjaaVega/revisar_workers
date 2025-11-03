@@ -6,8 +6,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import os, json, time, math
-from typing import Dict, List, Any
+import os, time, math
+from typing import Dict, List, Any, Tuple
+from threading import RLock
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,6 +18,26 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
+
+try:
+    CACHE_TTL = max(int(os.getenv("PROPERTIES_CACHE_TTL", "300")), 0)
+except ValueError:
+    CACHE_TTL = 300
+
+FEATURE_COLUMNS = [
+    'price',
+    'bedrooms',
+    'bathrooms',
+    'm2',
+    'price_per_m2',
+    'room_ratio',
+    'total_rooms',
+    'location_cluster'
+]
+
+_properties_cache: Dict[str, Any] = {"data": None, "expires_at": 0.0}
+_preprocessed_cache: Dict[str, Any] = {"df": None, "expires_at": 0.0}
+_cache_lock = RLock()
 
 # ---------- DB ----------
 def get_connection():
@@ -30,7 +51,7 @@ def get_connection():
         connect_timeout=10
     )
 
-def get_properties_data():
+def _fetch_properties_from_db() -> List[Dict[str, Any]]:
     conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute("""
@@ -46,6 +67,43 @@ def get_properties_data():
         return [dict(p) for p in props]
     finally:
         cur.close(); conn.close()
+
+
+def get_properties_data(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Obtain raw properties data with a small in-process cache.
+
+    A lightweight cache avoids re-reading the full table on each task execution,
+    which previously caused high latency in the workers when several jobs were
+    queued simultaneously.
+    """
+    now = time.time()
+    if not force_refresh and CACHE_TTL and now < _properties_cache["expires_at"] and _properties_cache["data"]:
+        return _properties_cache["data"]
+
+    data = _fetch_properties_from_db()
+
+    if CACHE_TTL:
+        with _cache_lock:
+            _properties_cache["data"] = data
+            _properties_cache["expires_at"] = now + CACHE_TTL
+
+    return list(data)
+
+
+def get_preprocessed_properties(force_refresh: bool = False) -> pd.DataFrame:
+    now = time.time()
+    if not force_refresh and CACHE_TTL and now < _preprocessed_cache["expires_at"] and _preprocessed_cache["df"] is not None:
+        return _preprocessed_cache["df"]
+
+    properties = get_properties_data(force_refresh=force_refresh)
+    df = preprocess_properties(properties) if properties else pd.DataFrame()
+
+    if CACHE_TTL:
+        with _cache_lock:
+            _preprocessed_cache["df"] = df
+            _preprocessed_cache["expires_at"] = now + CACHE_TTL
+
+    return df
 
 
 def preprocess_properties(properties: List[Dict]) -> pd.DataFrame:
@@ -70,40 +128,77 @@ def preprocess_properties(properties: List[Dict]) -> pd.DataFrame:
     df['room_ratio']    = df['bedrooms'] / (df['bathrooms'] + 1)  # evitar div/0
     df['total_rooms']   = df['bedrooms'] + df['bathrooms']
 
-    features = ['price','bedrooms','bathrooms','m2','price_per_m2','room_ratio','total_rooms','location_cluster']
-    df[features] = df[features].fillna(df[features].mean(numeric_only=True))
+    df[FEATURE_COLUMNS] = df[FEATURE_COLUMNS].fillna(df[FEATURE_COLUMNS].mean(numeric_only=True))
 
-    return df[features + ['id','name','location_address','comuna','lat','lon']]
+    return df[FEATURE_COLUMNS + ['id','name','location_address','comuna','lat','lon']]
 
-def apply_clustering_algorithm(df: pd.DataFrame, n_clusters: int = 8) -> pd.DataFrame:
-    features = ['price','bedrooms','bathrooms','m2','price_per_m2','room_ratio','total_rooms','location_cluster']
+def apply_clustering_algorithm(df: pd.DataFrame, n_clusters: int = 8) -> Tuple[pd.DataFrame, StandardScaler, np.ndarray]:
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(df[features])
+    X_scaled = scaler.fit_transform(df[FEATURE_COLUMNS])
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(X_scaled)
     df = df.copy()
-    df['cluster'] = kmeans.fit_predict(X_scaled)
-    return df
+    df['cluster'] = clusters
+    return df, scaler, X_scaled
 
-def calculate_user_preference_vector(user_preferences: Dict[str, Any]) -> np.ndarray:
-    vec = np.array([0.5]*8)
-    if user_preferences.get('budget_min') and user_preferences.get('budget_max'):
-        avg_budget = (user_preferences['budget_min'] + user_preferences['budget_max'])/2
-        vec[0] = min(avg_budget / 1_000_000, 1.0)  # normaliza ~ 1M
-    if user_preferences.get('bedrooms'):
-        vec[1] = min(int(user_preferences['bedrooms']), 5)/5.0
-    if user_preferences.get('bathrooms'):
-        vec[2] = min(int(user_preferences['bathrooms']), 4)/4.0
+def calculate_user_preference_vector(user_preferences: Dict[str, Any], defaults: Dict[str, float]) -> np.ndarray:
+    vec = np.array([defaults.get(col, 0.0) for col in FEATURE_COLUMNS], dtype=float)
+
+    budget_min = user_preferences.get('budget_min')
+    budget_max = user_preferences.get('budget_max')
+    if budget_min is not None or budget_max is not None:
+        values = [v for v in (budget_min, budget_max) if v is not None]
+        if values:
+            avg_budget = sum(values) / len(values)
+            vec[0] = float(avg_budget)
+
+    bedrooms = user_preferences.get('bedrooms')
+    if bedrooms is not None:
+        try:
+            bedrooms = float(bedrooms)
+            vec[1] = bedrooms
+        except (TypeError, ValueError):
+            pass
+
+    bathrooms = user_preferences.get('bathrooms')
+    if bathrooms is not None:
+        try:
+            bathrooms = float(bathrooms)
+            vec[2] = bathrooms
+        except (TypeError, ValueError):
+            pass
+
+    if bedrooms is not None and bathrooms is not None:
+        try:
+            vec[FEATURE_COLUMNS.index('room_ratio')] = bedrooms / (bathrooms + 1)
+            vec[FEATURE_COLUMNS.index('total_rooms')] = bedrooms + bathrooms
+        except ZeroDivisionError:
+            pass
+
     if user_preferences.get('location'):
-        vec[7] = (hash(user_preferences['location'].lower()) % 10) / 10.0
+        vec[FEATURE_COLUMNS.index('location_cluster')] = (hash(str(user_preferences['location']).lower()) % 10)
+
     return vec
 
-def find_similar_properties(df: pd.DataFrame, user_preferences: Dict[str, Any], n_recommendations: int = 10) -> List[Dict]:
-    features = ['price','bedrooms','bathrooms','m2','price_per_m2','room_ratio','total_rooms','location_cluster']
-    user_vector = calculate_user_preference_vector(user_preferences)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(df[features])
-    similarities = cosine_similarity([user_vector], X_scaled)[0]
+def find_similar_properties(
+    df: pd.DataFrame,
+    user_preferences: Dict[str, Any],
+    n_recommendations: int = 10,
+    scaler: StandardScaler = None,
+    scaled_features: np.ndarray = None,
+    defaults: Dict[str, float] = None
+) -> List[Dict]:
+    if defaults is None:
+        defaults = df[FEATURE_COLUMNS].mean(numeric_only=True).to_dict()
+
+    if scaler is None or scaled_features is None:
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(df[FEATURE_COLUMNS])
+
+    user_vector = calculate_user_preference_vector(user_preferences, defaults)
+    user_vector_scaled = scaler.transform([user_vector])
+    similarities = cosine_similarity(user_vector_scaled, scaled_features)[0]
 
     df = df.copy()
     df['similarity_score'] = similarities
@@ -146,16 +241,23 @@ def generate_recommendations(self, job_id: str, user_id: str, preferences: dict)
     t0 = time.perf_counter()
     self.update_state(state="PROGRESS", meta={"progress": 5})
 
-    props = get_properties_data()
-    if not props:
+    df = get_preprocessed_properties()
+    if df.empty:
         return {"recommendations": [], "total_found": 0, "error": "No properties found in database"}
 
     self.update_state(state="PROGRESS", meta={"progress": 30})
-    df = preprocess_properties(props)
-    df = apply_clustering_algorithm(df, n_clusters=8)
+    df, scaler, scaled_features = apply_clustering_algorithm(df, n_clusters=8)
 
     self.update_state(state="PROGRESS", meta={"progress": 80})
-    recs = find_similar_properties(df, preferences or {}, n_recommendations=10)
+    defaults = df[FEATURE_COLUMNS].mean(numeric_only=True).to_dict()
+    recs = find_similar_properties(
+        df,
+        preferences or {},
+        n_recommendations=10,
+        scaler=scaler,
+        scaled_features=scaled_features,
+        defaults=defaults
+    )
 
     dt = time.perf_counter() - t0
     self.update_state(state="PROGRESS", meta={"progress": 100})
